@@ -5,16 +5,22 @@ import yaml
 import logging
 import traceback
 import moto.cloudformation.utils
+
+from urllib.parse import urlparse
 from six import iteritems
-from six import string_types
+from moto.cloudformation.models import cloudformation_backends
+from moto.cloudformation import parsing
 from localstack.utils import common
 from localstack.utils.aws import aws_stack
+from localstack.constants import AWS_REGION_US_EAST_1
+from localstack.services.s3 import s3_listener
 from localstack.utils.testutil import create_zip_file
 from localstack.services.awslambda.lambda_api import get_handler_file_from_name
 
 ACTION_CREATE = 'create'
 ACTION_DELETE = 'delete'
 PLACEHOLDER_RESOURCE_NAME = '__resource_name__'
+PLACEHOLDER_AWS_NO_VALUE = '__aws_no_value__'
 
 LOG = logging.getLogger(__name__)
 
@@ -36,20 +42,29 @@ def str_or_none(o):
     return o if o is None else json.dumps(o) if isinstance(o, (dict, list)) else str(o)
 
 
-def select_attributes(obj, attrs):
-    result = {}
-    for attr in attrs:
-        if obj.get(attr) is not None:
-            result[attr] = str_or_none(obj.get(attr))
-    return result
+def params_select_attributes(*attrs):
+    def do_select(params, **kwargs):
+        result = {}
+        for attr in attrs:
+            if params.get(attr) is not None:
+                result[attr] = str_or_none(params.get(attr))
+        return result
+    return do_select
 
 
 def get_bucket_location_config(**kwargs):
-    return {'LocationConstraint': aws_stack.get_region()}
+    region = aws_stack.get_region()
+    if region == AWS_REGION_US_EAST_1:
+        return None
+    return {'LocationConstraint': region}
 
 
 def lambda_get_params():
     return lambda params, **kwargs: params
+
+
+def lambda_keys_to_lower(key=None):
+    return lambda params, **kwargs: common.keys_to_lower(params.get(key) if key else params)
 
 
 def rename_params(func, rename_map):
@@ -61,7 +76,7 @@ def rename_params(func, rename_map):
     return do_rename
 
 
-def params_list_to_dict(param_name, key_attr_name, value_attr_name):
+def params_list_to_dict(param_name, key_attr_name='Key', value_attr_name='Value'):
     def do_replace(params, **kwargs):
         result = {}
         for entry in params.get(param_name, []):
@@ -72,9 +87,28 @@ def params_list_to_dict(param_name, key_attr_name, value_attr_name):
     return do_replace
 
 
-def get_nested_stack_name(params, **kwargs):
+def params_dict_to_list(param_name, key_attr_name='Key', value_attr_name='Value', wrapper=None):
+    def do_replace(params, **kwargs):
+        result = []
+        for key, value in params.get(param_name, {}).items():
+            result.append({key_attr_name: key, value_attr_name: value})
+        if wrapper:
+            result = {wrapper: result}
+        return result
+    return do_replace
+
+
+def get_nested_stack_params(params, **kwargs):
     stack_name = kwargs.get('stack_name', 'stack')
-    return '%s-%s' % (stack_name, common.short_uid())
+    nested_stack_name = '%s-%s' % (stack_name, common.short_uid())
+    stack_params = params.get('Parameters', {})
+    stack_params = [{'ParameterKey': k, 'ParameterValue': v} for k, v in stack_params.items()]
+    result = {
+        'StackName': nested_stack_name,
+        'TemplateURL': params.get('TemplateURL'),
+        'Parameters': stack_params
+    }
+    return result
 
 
 def get_lambda_code_param(params, **kwargs):
@@ -100,8 +134,76 @@ def sns_subscription_params(params, **kwargs):
     return result
 
 
+def events_put_rule_params(params, **kwargs):
+    attrs = ['ScheduleExpression', 'EventPattern', 'State', 'Description', 'Name']
+    result = select_parameters(*attrs)(params, **kwargs)
+    result['Name'] = result.get('Name') or PLACEHOLDER_RESOURCE_NAME
+
+    def wrap_in_lists(o, **kwargs):
+        if isinstance(o, dict):
+            for k, v in o.items():
+                if not isinstance(v, (dict, list)):
+                    o[k] = [v]
+        return o
+
+    pattern = result.get('EventPattern')
+    if isinstance(pattern, dict):
+        wrapped = common.recurse_object(pattern, wrap_in_lists)
+        result['EventPattern'] = json.dumps(wrapped)
+    return result
+
+
+def es_add_tags_params(params, **kwargs):
+    es_arn = aws_stack.es_domain_arn(params.get('DomainName'))
+    tags = params.get('Tags', [])
+    return {'ARN': es_arn, 'TagList': tags}
+
+
+def s3_bucket_notification_config(params, **kwargs):
+    notif_config = params.get('NotificationConfiguration')
+    if not notif_config:
+        return None
+
+    lambda_configs = []
+    queue_configs = []
+    topic_configs = []
+
+    attr_tuples = (
+        ('LambdaConfigurations', lambda_configs, 'LambdaFunctionArn', 'Function'),
+        ('QueueConfigurations', queue_configs, 'QueueArn', 'Queue'),
+        ('TopicConfigurations', topic_configs, 'TopicArn', 'Topic')
+    )
+
+    # prepare lambda/queue/topic notification configs
+    for attrs in attr_tuples:
+        for config in notif_config.get(attrs[0]) or []:
+            filter_rules = config.get('Filter', {}).get('S3Key', {}).get('Rules')
+            entry = {
+                attrs[2]: config[attrs[3]],
+                'Events': [config['Event']]
+            }
+            if filter_rules:
+                entry['Filter'] = {'Key': {'FilterRules': filter_rules}}
+            attrs[1].append(entry)
+
+    # construct final result
+    result = {
+        'Bucket': params.get('BucketName') or PLACEHOLDER_RESOURCE_NAME,
+        'NotificationConfiguration': {
+            'LambdaFunctionConfigurations': lambda_configs,
+            'QueueConfigurations': queue_configs,
+            'TopicConfigurations': topic_configs
+        }
+    }
+    return result
+
+
 def select_parameters(*param_names):
     return lambda params, **kwargs: dict([(k, v) for k, v in params.items() if k in param_names])
+
+
+def merge_parameters(func1, func2):
+    return lambda params, **kwargs: common.merge_dicts(func1(params, **kwargs), func2(params, **kwargs))
 
 
 def dump_json_params(param_func=None, *param_names):
@@ -127,23 +229,83 @@ def param_defaults(param_func, defaults):
     return replace
 
 
+def iam_create_policy_params(params, **kwargs):
+    result = {'PolicyName': params['PolicyName']}
+    policy_doc = remove_none_values(params['PolicyDocument'])
+    result['PolicyDocument'] = json.dumps(policy_doc)
+    return result
+
+
+def lambda_permission_params(params, **kwargs):
+    result = select_parameters('FunctionName', 'Action', 'Principal')(params, **kwargs)
+    result['StatementId'] = common.short_uid()
+    return result
+
+
+def get_ddb_provisioned_throughput(params, **kwargs):
+    args = params.get('ProvisionedThroughput')
+    if args:
+        if isinstance(args['ReadCapacityUnits'], str):
+            args['ReadCapacityUnits'] = int(args['ReadCapacityUnits'])
+        if isinstance(args['WriteCapacityUnits'], str):
+            args['WriteCapacityUnits'] = int(args['WriteCapacityUnits'])
+    return args
+
+
+def get_ddb_global_sec_indexes(params, **kwargs):
+    args = params.get('GlobalSecondaryIndexes')
+    if args:
+        for index in args:
+            provisoned_throughput = index['ProvisionedThroughput']
+            if isinstance(provisoned_throughput['ReadCapacityUnits'], str):
+                provisoned_throughput['ReadCapacityUnits'] = int(provisoned_throughput['ReadCapacityUnits'])
+            if isinstance(provisoned_throughput['WriteCapacityUnits'], str):
+                provisoned_throughput['WriteCapacityUnits'] = int(provisoned_throughput['WriteCapacityUnits'])
+    return args
+
+
+def get_apigw_resource_params(params, **kwargs):
+    result = {
+        'restApiId': params.get('RestApiId'),
+        'pathPart': params.get('PathPart'),
+        'parentId': params.get('ParentId')
+    }
+    if not result.get('parentId'):
+        # get root resource id
+        apigw = aws_stack.connect_to_service('apigateway')
+        resources = apigw.get_resources(restApiId=result['restApiId'])['items']
+        root_resource = ([r for r in resources if r['path'] == '/'] or [None])[0]
+        if not root_resource:
+            raise Exception('Unable to find root resource for REST API %s' % result['restApiId'])
+        result['parentId'] = root_resource['id']
+    return result
+
+
 # maps resource types to functions and parameters for creation
 RESOURCE_TO_FUNCTION = {
     'S3::Bucket': {
-        'create': {
+        'create': [{
             'function': 'create_bucket',
             'parameters': {
                 'Bucket': ['BucketName', PLACEHOLDER_RESOURCE_NAME],
                 'ACL': lambda params, **kwargs: convert_acl_cf_to_s3(params.get('AccessControl', 'PublicRead')),
                 'CreateBucketConfiguration': lambda params, **kwargs: get_bucket_location_config()
             }
-        },
-        'delete': {
+        }, {
+            'function': 'put_bucket_notification_configuration',
+            'parameters': s3_bucket_notification_config
+        }],
+        'delete': [{
+            'function': 'delete_bucket_policy',
+            'parameters': {
+                'Bucket': 'PhysicalResourceId'
+            }
+        }, {
             'function': 'delete_bucket',
             'parameters': {
                 'Bucket': 'PhysicalResourceId'
             }
-        }
+        }]
     },
     'S3::BucketPolicy': {
         'create': {
@@ -156,11 +318,11 @@ RESOURCE_TO_FUNCTION = {
             'function': 'create_queue',
             'parameters': {
                 'QueueName': ['QueueName', PLACEHOLDER_RESOURCE_NAME],
-                'Attributes': lambda params, **kwargs: select_attributes(params,
-                    ['DelaySeconds', 'MaximumMessageSize', 'MessageRetentionPeriod',
-                     'VisibilityTimeout', 'RedrivePolicy']
+                'Attributes': params_select_attributes(
+                    'ContentBasedDeduplication', 'DelaySeconds', 'FifoQueue', 'MaximumMessageSize',
+                    'MessageRetentionPeriod', 'VisibilityTimeout', 'RedrivePolicy', 'ReceiveMessageWaitTimeSeconds'
                 ),
-                'tags': params_list_to_dict('Tags', 'Key', 'Value')
+                'tags': params_list_to_dict('Tags')
             }
         },
         'delete': {
@@ -185,8 +347,69 @@ RESOURCE_TO_FUNCTION = {
             }
         }
     },
+    'SSM::Parameter': {
+        'create': {
+            'function': 'put_parameter',
+            'parameters': merge_parameters(params_dict_to_list('Tags', wrapper='Tags'), params_select_attributes(
+                'Name', 'Type', 'Value', 'Description', 'AllowedPattern', 'Policies', 'Tier'))
+        }
+    },
+    'SecretsManager::Secret': {
+        'create': {
+            'function': 'create_secret',
+            'parameters': select_parameters('Name', 'Description', 'SecretString', 'KmsKeyId', 'Tags')
+        },
+        'delete': {
+            'function': 'delete_secret',
+            'parameters': {
+                'SecretId': 'PhysicalResourceId'
+            }
+        }
+    },
+    'KinesisFirehose::DeliveryStream': {
+        'create': {
+            'function': 'create_delivery_stream',
+            'parameters': select_parameters('DeliveryStreamName', 'DeliveryStreamType',
+                'S3DestinationConfiguration', 'ElasticsearchDestinationConfiguration')
+        },
+        'delete': {
+            'function': 'delete_delivery_stream',
+            'parameters': {
+                'DeliveryStreamName': 'PhysicalResourceId'
+            }
+        }
+    },
+    'Elasticsearch::Domain': {
+        'create': [{
+            'function': 'create_elasticsearch_domain',
+            'parameters': select_parameters('AccessPolicies', 'AdvancedOptions', 'CognitoOptions',
+                'DomainName', 'EBSOptions', 'ElasticsearchClusterConfig', 'ElasticsearchVersion',
+                'EncryptionAtRestOptions', 'LogPublishingOptions', 'NodeToNodeEncryptionOptions',
+                'SnapshotOptions', 'VPCOptions')
+        }, {
+            'function': 'add_tags',
+            'parameters': es_add_tags_params
+        }],
+        'delete': {
+            'function': 'delete_elasticsearch_domain',
+            'parameters': {
+                'DomainName': 'PhysicalResourceId'
+            }
+        }
+    },
     'Logs::LogGroup': {
-        # TODO implement
+        'create': {
+            'function': 'create_log_group',
+            'parameters': {
+                'logGroupName': 'LogGroupName'
+            }
+        },
+        'delete': {
+            'function': 'delete_log_group',
+            'parameters': {
+                'logGroupName': 'PhysicalResourceId'
+            }
+        }
     },
     'Lambda::Function': {
         'create': {
@@ -206,30 +429,31 @@ RESOURCE_TO_FUNCTION = {
             'defaults': {
                 'Role': 'test_role'
             }
+        },
+        'delete': {
+            'function': 'delete_function',
+            'parameters': {
+                'FunctionName': 'PhysicalResourceId'
+            }
         }
     },
     'Lambda::Version': {
         'create': {
             'function': 'publish_version',
-            'parameters': {
-                'FunctionName': 'FunctionName',
-                'CodeSha256': 'CodeSha256',
-                'Description': 'Description'
-            }
+            'parameters': select_parameters('FunctionName', 'CodeSha256', 'Description')
         }
     },
-    'Lambda::Permission': {},
+    'Lambda::Permission': {
+        'create': {
+            'function': 'add_permission',
+            'parameters': lambda_permission_params
+        }
+    },
     'Lambda::EventSourceMapping': {
         'create': {
             'function': 'create_event_source_mapping',
-            'parameters': {
-                'FunctionName': 'FunctionName',
-                'EventSourceArn': 'EventSourceArn',
-                'StartingPosition': 'StartingPosition',
-                'Enabled': 'Enabled',
-                'BatchSize': 'BatchSize',
-                'StartingPositionTimestamp': 'StartingPositionTimestamp'
-            }
+            'parameters': select_parameters('FunctionName', 'EventSourceArn', 'Enabled',
+                'StartingPosition', 'BatchSize', 'StartingPositionTimestamp')
         }
     },
     'DynamoDB::Table': {
@@ -239,9 +463,9 @@ RESOURCE_TO_FUNCTION = {
                 'TableName': 'TableName',
                 'AttributeDefinitions': 'AttributeDefinitions',
                 'KeySchema': 'KeySchema',
-                'ProvisionedThroughput': 'ProvisionedThroughput',
+                'ProvisionedThroughput': get_ddb_provisioned_throughput,
                 'LocalSecondaryIndexes': 'LocalSecondaryIndexes',
-                'GlobalSecondaryIndexes': 'GlobalSecondaryIndexes',
+                'GlobalSecondaryIndexes': get_ddb_global_sec_indexes,
                 'StreamSpecification': lambda params, **kwargs: (
                     common.merge_dicts(params.get('StreamSpecification'), {'StreamEnabled': True}, default=None))
             },
@@ -251,18 +475,18 @@ RESOURCE_TO_FUNCTION = {
                     'WriteCapacityUnits': 5
                 }
             }
+        },
+        'delete': {
+            'function': 'delete_table',
+            'parameters': {
+                'TableName': 'PhysicalResourceId'
+            }
         }
     },
     'Events::Rule': {
         'create': [{
             'function': 'put_rule',
-            'parameters': {
-                'Name': PLACEHOLDER_RESOURCE_NAME,
-                'ScheduleExpression': 'ScheduleExpression',
-                'EventPattern': 'EventPattern',
-                'State': 'State',
-                'Description': 'Description'
-            }
+            'parameters': events_put_rule_params
         }, {
             'function': 'put_targets',
             'parameters': {
@@ -270,7 +494,13 @@ RESOURCE_TO_FUNCTION = {
                 'EventBusName': 'EventBusName',
                 'Targets': 'Targets'
             }
-        }]
+        }],
+        'delete': {
+            'function': 'delete_rule',
+            'parameters': {
+                'Name': 'PhysicalResourceId'
+            }
+        }
     },
     'IAM::Role': {
         'create': {
@@ -282,7 +512,21 @@ RESOURCE_TO_FUNCTION = {
                             'Description', 'MaxSessionDuration', 'PermissionsBoundary', 'Tags'),
                         'AssumeRolePolicyDocument'),
                     {'RoleName': PLACEHOLDER_RESOURCE_NAME})
+        },
+        'delete': {
+            'function': 'delete_role',
+            'parameters': {
+                'RoleName': 'PhysicalResourceId'
+            }
         }
+    },
+    'IAM::Policy': {
+        'create': {
+            'function': 'create_policy',
+            # TODO: associate policies with users, groups, roles
+            'parameters': iam_create_policy_params
+        }
+        # InlinePolicy in cloudformation will be deleted on deleting Role
     },
     'ApiGateway::RestApi': {
         'create': {
@@ -291,16 +535,18 @@ RESOURCE_TO_FUNCTION = {
                 'name': 'Name',
                 'description': 'Description'
             }
+        },
+        'delete': {
+            'function': 'delete_rest_api',
+            'parameters': {
+                'restApiId': 'PhysicalResourceId',
+            }
         }
     },
     'ApiGateway::Resource': {
         'create': {
             'function': 'create_resource',
-            'parameters': {
-                'restApiId': 'RestApiId',
-                'pathPart': 'PathPart',
-                'parentId': 'ParentId'
-            }
+            'parameters': get_apigw_resource_params
         }
     },
     'ApiGateway::Method': {
@@ -316,6 +562,14 @@ RESOURCE_TO_FUNCTION = {
         }
     },
     'ApiGateway::Method::Integration': {
+    },
+    'ApiGateway::Account': {
+    },
+    'ApiGateway::Stage': {
+        'create': {
+            'function': 'create_stage',
+            'parameters': lambda_keys_to_lower()
+        }
     },
     'ApiGateway::Deployment': {
         'create': {
@@ -366,6 +620,12 @@ RESOURCE_TO_FUNCTION = {
                 'definition': 'DefinitionString',
                 'roleArn': lambda params, **kwargs: get_role_arn(params.get('RoleArn'), **kwargs)
             }
+        },
+        'delete': {
+            'function': 'delete_state_machine',
+            'parameters': {
+                'stateMachineArn': 'PhysicalResourceId'
+            }
         }
     },
     'StepFunctions::Activity': {
@@ -391,10 +651,7 @@ RESOURCE_TO_FUNCTION = {
     'CloudFormation::Stack': {
         'create': {
             'function': 'create_stack',
-            'parameters': {
-                'StackName': get_nested_stack_name,
-                'TemplateURL': 'TemplateURL'
-            }
+            'parameters': get_nested_stack_params
         }
     }
 }
@@ -403,6 +660,7 @@ RESOURCE_TO_FUNCTION = {
 # ----------------
 # UTILITY METHODS
 # ----------------
+
 
 def convert_acl_cf_to_s3(acl):
     """ Convert a CloudFormation ACL string (e.g., 'PublicRead') to an S3 ACL string (e.g., 'public-read') """
@@ -457,6 +715,10 @@ def get_service_name(resource):
         return 'cognito-idp'
     if parts[-2] == 'Cognito':
         return 'cognito-idp'
+    if parts[-2] == 'Elasticsearch':
+        return 'es'
+    if parts[-2] == 'KinesisFirehose':
+        return 'firehose'
     return parts[1].lower()
 
 
@@ -469,7 +731,7 @@ def get_resource_name(resource):
 
     # try to extract name from attributes
     if res_type == 'S3::Bucket':
-        name = properties.get('BucketName')
+        name = s3_listener.normalize_bucket_name(properties.get('BucketName'))
     elif res_type == 'SQS::Queue':
         name = properties.get('QueueName')
     elif res_type == 'Cognito::UserPool':
@@ -509,6 +771,18 @@ def describe_stack_resource(stack_name, logical_resource_id):
                     (logical_resource_id, stack_name, e))
 
 
+def retrieve_and_update_resource_details(resource_id, resource_status, resources, stack_name):
+    resource = resources.get(resource_id) or {}
+    resource_props = resource.get('Properties') or {}
+    result = retrieve_resource_details(resource_id, resource_status, resources, stack_name)
+    if isinstance(result, dict):
+        result.pop('ResponseMetadata', None)
+        # Note: for now, we're only setting non-existing props (we may set changed props in the future as well)
+        update_attrs = {k: v for k, v in result.items() if k not in resource_props}
+        resource_props.update(update_attrs)
+    return result
+
+
 def retrieve_resource_details(resource_id, resource_status, resources, stack_name):
     resource = resources.get(resource_id)
     resource_id = resource_status.get('PhysicalResourceId') or resource_id
@@ -518,16 +792,18 @@ def retrieve_resource_details(resource_id, resource_status, resources, stack_nam
     resource_props = resource.get('Properties')
     try:
         if resource_type == 'Lambda::Function':
-            resource_id = resource_props['FunctionName'] if resource else resource_id
+            func_name = resolve_refs_recursively(stack_name, resource_props['FunctionName'], resources)
+            resource_id = func_name if resource else resource_id
             return aws_stack.connect_to_service('lambda').get_function(FunctionName=resource_id)
         elif resource_type == 'Lambda::Version':
-            name = resource_props.get('FunctionName')
+            name = resolve_refs_recursively(stack_name, resource_props.get('FunctionName'), resources)
             if not name:
                 return None
             func_name = aws_stack.lambda_function_name(name)
             func_version = name.split(':')[7] if len(name.split(':')) > 7 else '$LATEST'
             versions = aws_stack.connect_to_service('lambda').list_versions_by_function(FunctionName=func_name)
             return ([v for v in versions['Versions'] if v['Version'] == func_version] or [None])[0]
+
         elif resource_type == 'Lambda::EventSourceMapping':
             resource_id = resource_props['FunctionName'] if resource else resource_id
             source_arn = resource_props.get('EventSourceArn')
@@ -543,24 +819,37 @@ def retrieve_resource_details(resource_id, resource_status, resources, stack_nam
             if not mapping:
                 raise Exception('ResourceNotFound')
             return mapping[0]
+
+        elif resource_type == 'Events::Rule':
+            rule_name = resolve_refs_recursively(stack_name, resource_props.get('Name'), resources)
+            result = aws_stack.connect_to_service('events').describe_rule(Name=rule_name) or {}
+            return result if result.get('Name') else None
+
         elif resource_type == 'IAM::Role':
-            role_name = resource_props.get('RoleName') or resource_id
-            role_name = resolve_refs_recursively(stack_name, role_name, resources)
+            role_name = resolve_refs_recursively(stack_name, resource_props.get('RoleName'), resources)
             return aws_stack.connect_to_service('iam').get_role(RoleName=role_name)['Role']
+
+        elif resource_type == 'SSM::Parameter':
+            param_name = resource_props.get('Name') or resource_id
+            param_name = resolve_refs_recursively(stack_name, param_name, resources)
+            return aws_stack.connect_to_service('ssm').get_parameter(Name=param_name)['Parameter']
+
         elif resource_type == 'DynamoDB::Table':
             table_name = resource_props.get('TableName') or resource_id
             table_name = resolve_refs_recursively(stack_name, table_name, resources)
             return aws_stack.connect_to_service('dynamodb').describe_table(TableName=table_name)
+
         elif resource_type == 'ApiGateway::RestApi':
             apis = aws_stack.connect_to_service('apigateway').get_rest_apis()['items']
-            api_name = resource_props['Name'] if resource else resource_id
+            api_name = resource_props.get('Name') or resource_id
             api_name = resolve_refs_recursively(stack_name, api_name, resources)
             result = list(filter(lambda api: api['name'] == api_name, apis))
             return result[0] if result else None
+
         elif resource_type == 'ApiGateway::Resource':
             api_id = resource_props['RestApiId'] if resource else resource_id
             api_id = resolve_refs_recursively(stack_name, api_id, resources)
-            parent_id = resolve_refs_recursively(stack_name, resource_props['ParentId'], resources)
+            parent_id = resolve_refs_recursively(stack_name, resource_props.get('ParentId'), resources)
             if not api_id or not parent_id:
                 return None
             api_resources = aws_stack.connect_to_service('apigateway').get_resources(restApiId=api_id)['items']
@@ -572,6 +861,7 @@ def retrieve_resource_details(resource_id, resource_status, resources, stack_nam
                 target_resource[0]['id'], resources=api_resources)
             result = list(filter(lambda res: res['path'] == path, api_resources))
             return result[0] if result else None
+
         elif resource_type == 'ApiGateway::Deployment':
             api_id = resource_props['RestApiId'] if resource else resource_id
             api_id = resolve_refs_recursively(stack_name, api_id, resources)
@@ -580,55 +870,99 @@ def retrieve_resource_details(resource_id, resource_status, resources, stack_nam
             result = aws_stack.connect_to_service('apigateway').get_deployments(restApiId=api_id)['items']
             # TODO possibly filter results by stage name or other criteria
             return result[0] if result else None
+
+        elif resource_type == 'ApiGateway::Stage':
+            api_id = resource_props['RestApiId'] if resource else resource_id
+            api_id = resolve_refs_recursively(stack_name, api_id, resources)
+            if not api_id:
+                return None
+            result = aws_stack.connect_to_service('apigateway').get_stage(restApiId=api_id,
+                stageName=resource_props['StageName'])
+            return result
+
         elif resource_type == 'ApiGateway::Method':
             api_id = resolve_refs_recursively(stack_name, resource_props['RestApiId'], resources)
             res_id = resolve_refs_recursively(stack_name, resource_props['ResourceId'], resources)
             if not api_id or not res_id:
                 return None
             res_obj = aws_stack.connect_to_service('apigateway').get_resource(restApiId=api_id, resourceId=res_id)
-            match = [v for (k, v) in res_obj['resourceMethods'].items()
+            match = [v for (k, v) in res_obj.get('resourceMethods', {}).items()
                      if resource_props['HttpMethod'] in (v.get('httpMethod'), k)]
-            int_props = resource_props.get('Integration')
-            if int_props:
+            int_props = resource_props.get('Integration') or {}
+            if int_props.get('Type') == 'AWS_PROXY':
                 match = [m for m in match if
-                    m.get('methodIntegration', {}).get('type') == int_props.get('Type') and
+                    m.get('methodIntegration', {}).get('type') == 'AWS_PROXY' and
                     m.get('methodIntegration', {}).get('httpMethod') == int_props.get('IntegrationHttpMethod')]
             return any(match) or None
+
         elif resource_type == 'ApiGateway::GatewayResponse':
             api_id = resolve_refs_recursively(stack_name, resource_props['RestApiId'], resources)
             client = aws_stack.connect_to_service('apigateway')
             result = client.get_gateway_response(restApiId=api_id, responseType=resource_props['ResponseType'])
             return result if 'responseType' in result else None
+
         elif resource_type == 'SQS::Queue':
+            queue_name = resolve_refs_recursively(stack_name, resource_props['QueueName'], resources)
             sqs_client = aws_stack.connect_to_service('sqs')
             queues = sqs_client.list_queues()
             result = list(filter(lambda item:
                 # TODO possibly find a better way to compare resource_id with queue URLs
-                item.endswith('/%s' % resource_id), queues.get('QueueUrls', [])))
+                item.endswith('/%s' % queue_name), queues.get('QueueUrls', [])))
             if not result:
                 return None
             result = sqs_client.get_queue_attributes(QueueUrl=result[0], AttributeNames=['All'])['Attributes']
             result['Arn'] = result['QueueArn']
             return result
+
         elif resource_type == 'SNS::Topic':
+            topic_name = resolve_refs_recursively(stack_name, resource_props['TopicName'], resources)
             topics = aws_stack.connect_to_service('sns').list_topics()
-            result = list(filter(lambda item: item['TopicArn'] == resource_id, topics.get('Topics', [])))
+            result = list(filter(lambda item: item['TopicArn'].split(':')[-1] == topic_name, topics.get('Topics', [])))
             return result[0] if result else None
+
+        elif resource_type == 'SNS::Subscription':
+            topic_arn = resource_props.get('TopicArn')
+            topic_arn = resolve_refs_recursively(stack_name, topic_arn, resources)
+            subs = aws_stack.connect_to_service('sns').list_subscriptions_by_topic(TopicArn=topic_arn)
+            result = [sub for sub in subs['Subscriptions'] if
+                resource_props.get('Protocol') == sub['Protocol'] and
+                resource_props.get('Endpoint') == sub['Endpoint']]
+            # TODO: use get_subscription_attributes to compare FilterPolicy
+            return result[0] if result else None
+
         elif resource_type == 'S3::Bucket':
             bucket_name = resource_props.get('BucketName') or resource_id
             bucket_name = resolve_refs_recursively(stack_name, bucket_name, resources)
-            return aws_stack.connect_to_service('s3').get_bucket_location(Bucket=bucket_name)
+            bucket_name = s3_listener.normalize_bucket_name(bucket_name)
+            s3_client = aws_stack.connect_to_service('s3')
+            response = s3_client.get_bucket_location(Bucket=bucket_name)
+            notifs = resource_props.get('NotificationConfiguration')
+            if not response or not notifs:
+                return response
+            configs = s3_client.get_bucket_notification_configuration(Bucket=bucket_name)
+            has_notifs = (configs.get('TopicConfigurations') or configs.get('QueueConfigurations') or
+                configs.get('LambdaFunctionConfigurations'))
+            if notifs and not has_notifs:
+                return None
+            return response
+
         elif resource_type == 'S3::BucketPolicy':
             bucket_name = resource_props.get('Bucket') or resource_id
             bucket_name = resolve_refs_recursively(stack_name, bucket_name, resources)
             return aws_stack.connect_to_service('s3').get_bucket_policy(Bucket=bucket_name)
+
         elif resource_type == 'Logs::LogGroup':
-            # TODO implement
-            raise Exception('ResourceNotFound')
+            group_name = resource_props.get('LogGroupName')
+            group_name = resolve_refs_recursively(stack_name, group_name, resources)
+            logs = aws_stack.connect_to_service('logs')
+            groups = logs.describe_log_groups(logGroupNamePrefix=group_name)['logGroups']
+            return ([g for g in groups if g['logGroupName'] == group_name] or [None])[0]
+
         elif resource_type == 'Kinesis::Stream':
             stream_name = resolve_refs_recursively(stack_name, resource_props['Name'], resources)
             result = aws_stack.connect_to_service('kinesis').describe_stream(StreamName=stream_name)
             return result
+
         elif resource_type == 'StepFunctions::StateMachine':
             sm_name = resource_props.get('StateMachineName') or resource_id
             sm_name = resolve_refs_recursively(stack_name, sm_name, resources)
@@ -639,6 +973,7 @@ def retrieve_resource_details(resource_id, resource_status, resources, stack_nam
                 return None
             result = sfn_client.describe_state_machine(stateMachineArn=sm_arn[0])
             return result
+
         elif resource_type == 'StepFunctions::Activity':
             act_name = resource_props.get('Name') or resource_id
             act_name = resolve_refs_recursively(stack_name, act_name, resources)
@@ -648,45 +983,109 @@ def retrieve_resource_details(resource_id, resource_status, resources, stack_nam
             if not result:
                 return None
             return result[0]
+
+        elif resource_type == 'SecretsManager::Secret':
+            secret_name = resource_props.get('Name') or resource_id
+            secret_name = resolve_refs_recursively(stack_name, secret_name, resources)
+            return aws_stack.connect_to_service('secretsmanager').describe_secret(SecretId=secret_name)
+
+        elif resource_type == 'Elasticsearch::Domain':
+            domain_name = resource_props.get('DomainName') or resource_id
+            domain_name = resolve_refs_recursively(stack_name, domain_name, resources)
+            return aws_stack.connect_to_service('es').describe_elasticsearch_domain(DomainName=domain_name)
+
+        elif resource_type == 'KinesisFirehose::DeliveryStream':
+            stream_name = resource_props.get('DeliveryStreamName') or resource_id
+            stream_name = resolve_refs_recursively(stack_name, stream_name, resources)
+            return aws_stack.connect_to_service('firehose').describe_delivery_stream(DeliveryStreamName=stream_name)
+
+        elif resource_type == 'IAM::Policy':
+            client = aws_stack.connect_to_service('iam')
+            policy_name = resource_props.get('PolicyName') or resource_id
+
+            # The policy in cloudformation is InlinePolicy, so we must specify at least one of [Roles, Users, Groups]
+            # https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-iam-policy.html
+            roles = resource['Properties'].get('Roles', [])
+            if roles:
+                if isinstance(roles[0], str):
+                    role_name = roles[0]
+                else:
+                    role_name = resources[roles[0]['Ref']]['Properties']['RoleName']
+
+                role_policy = client.get_role_policy(RoleName=role_name, PolicyName=policy_name)
+                return role_policy
+
+            # TODO The InlinePolicy can be embedded in specified User, or Group
+
         if is_deployable_resource(resource):
             LOG.warning('Unexpected resource type %s when resolving references of resource %s: %s' %
                         (resource_type, resource_id, resource))
+
     except Exception as e:
         check_not_found_exception(e, resource_type, resource, resource_status)
+
     return None
 
 
 def check_not_found_exception(e, resource_type, resource, resource_status):
     # we expect this to be a "not found" exception
-    markers = ['NoSuchBucket', 'ResourceNotFound', '404', 'not found']
+    markers = ['NoSuchBucket', 'ResourceNotFound', 'NotFoundException', '404', 'not found']
     if not list(filter(lambda marker, e=e: marker in str(e), markers)):
         LOG.warning('Unexpected error retrieving details for resource %s: %s %s - %s %s' %
             (resource_type, e, traceback.format_exc(), resource, resource_status))
 
 
-def extract_resource_attribute(resource_type, resource, attribute):
+def extract_resource_attribute(resource_type, resource_json, attribute, resource_id=None, resource=None):
     LOG.debug('Extract resource attribute: %s %s' % (resource_type, attribute))
     # extract resource specific attributes
     if resource_type == 'Lambda::Function':
-        actual_attribute = 'FunctionArn' if attribute == 'Arn' else attribute
-        return resource['Configuration'][actual_attribute]
+        func_configs = resource_json.get('Configuration')
+        if attribute in ['Arn', 'PhysicalResourceId']:
+            if isinstance(resource, dict):
+                func_configs = resource.get('Properties', {})
+            return func_configs.get('FunctionArn') or aws_stack.lambda_function_arn(func_configs.get('FunctionName'))
+        return func_configs.get(attribute)
     elif resource_type == 'DynamoDB::Table':
         actual_attribute = 'LatestStreamArn' if attribute == 'StreamArn' else attribute
-        value = resource['Table'].get(actual_attribute)
+        value = resource_json['Table'].get(actual_attribute)
         return value
     elif resource_type == 'ApiGateway::RestApi':
         if attribute == 'PhysicalResourceId':
-            return resource['id']
+            return resource_json['id']
         if attribute == 'RootResourceId':
-            resources = aws_stack.connect_to_service('apigateway').get_resources(restApiId=resource['id'])['items']
+            resources = aws_stack.connect_to_service('apigateway').get_resources(restApiId=resource_json['id'])['items']
             for res in resources:
                 if res['path'] == '/' and not res.get('parentId'):
                     return res['id']
     elif resource_type == 'ApiGateway::Resource':
         if attribute == 'PhysicalResourceId':
-            return resource['id']
+            return resource_json['id']
+    elif resource_type == 'S3::Bucket':
+        if attribute == 'PhysicalResourceId' and isinstance(resource, dict):
+            return resource.get('Properties', {}).get('BucketName')
     attribute_lower = common.first_char_to_lower(attribute)
-    return resource.get(attribute) or resource.get(attribute_lower)
+    result = resource_json.get(attribute) or resource_json.get(attribute_lower)
+    if result is None and isinstance(resource, dict):
+        res_json1 = resource.get('Properties', {})
+        result = res_json1.get(attribute) or res_json1.get(attribute_lower)
+        if result is None:
+            result = get_attr_from_model_instance(resource, attribute,
+                resource_type=resource_type, resource_id=resource_id)
+    return result
+
+
+def get_attr_from_model_instance(resource, attribute, resource_type, resource_id=None):
+    if not resource_type.startswith('AWS::'):
+        resource_type = 'AWS::%s' % resource_type
+    model_clazz = parsing.MODEL_MAP.get(resource_type)
+    if not model_clazz:
+        LOG.info('Unable to find model class for resource type "%s"' % resource_type)
+        return
+    try:
+        inst = model_clazz(resource_name=resource_id, resource_json=resource)
+        return inst.get_cfn_attribute(attribute)
+    except Exception:
+        pass
 
 
 def resolve_ref(stack_name, ref, resources, attribute):
@@ -696,6 +1095,8 @@ def resolve_ref(stack_name, ref, resources, attribute):
         return 'aws'
     if ref == 'AWS::StackName':
         return stack_name
+    if ref == 'AWS::NoValue':
+        return PLACEHOLDER_AWS_NO_VALUE
 
     # first, check stack parameters
     stack_param = get_stack_parameter(stack_name, ref)
@@ -704,60 +1105,89 @@ def resolve_ref(stack_name, ref, resources, attribute):
 
     # second, resolve resource references
     resource_status = {}
-    if stack_name:
-        resource_status = describe_stack_resource(stack_name, ref)
-        if not resource_status:
-            return
-        attr_value = resource_status.get(attribute)
-        if attr_value not in [None, '']:
-            return attr_value
-    elif ref in resources:
-        resource_status = resources[ref]['__details__']
+
+    # TODO: check if the logic below (calling describe_stack_resource during deployment) is still required!
+    # if stack_name:
+    #     resource_status = describe_stack_resource(stack_name, ref)
+    #     if not resource_status:
+    #         return
+    #     attr_value = resource_status.get(attribute)
+    #     if attr_value not in [None, '']:
+    #         return attr_value
+
+    if not resource_status and resources.get(ref):
+        resource_status = resources[ref].get('__details__', {})
+    if not resource_status and resources.get(ref):
+        if isinstance(resources[ref].get(attribute), (str, int, float, bool, dict)):
+            return resources[ref][attribute]
     # fetch resource details
     resource_new = retrieve_resource_details(ref, resource_status, resources, stack_name)
     if not resource_new:
         return
     resource = resources.get(ref)
     resource_type = get_resource_type(resource)
-    result = extract_resource_attribute(resource_type, resource_new, attribute)
+    result = extract_resource_attribute(resource_type, resource_new, attribute, resource_id=ref, resource=resource)
     if not result:
-        LOG.warning('Unable to extract reference attribute %s from resource: %s' % (attribute, resource_new))
+        LOG.warning('Unable to extract reference attribute %s from resource: %s %s' %
+            (attribute, resource_new, resource))
     return result
 
 
 def resolve_refs_recursively(stack_name, value, resources):
     if isinstance(value, dict):
         keys_list = list(value.keys())
+
         # process special operators
         if keys_list == ['Ref']:
-            return resolve_ref(stack_name, value['Ref'],
-                resources, attribute='PhysicalResourceId')
+            return resolve_ref(stack_name, value['Ref'], resources, attribute='PhysicalResourceId')
+
         if keys_list and keys_list[0].lower() == 'fn::getatt':
-            return resolve_ref(stack_name, value[keys_list[0]][0],
-                resources, attribute=value[keys_list[0]][1])
+            return resolve_ref(stack_name, value[keys_list[0]][0], resources, attribute=value[keys_list[0]][1])
+
         if keys_list and keys_list[0].lower() == 'fn::join':
             join_values = value[keys_list[0]][1]
             join_values = [resolve_refs_recursively(stack_name, v, resources) for v in join_values]
             none_values = [v for v in join_values if v is None]
             if none_values:
                 raise Exception('Cannot resolve CF fn::Join %s due to null values: %s' % (value, join_values))
+
             return value[keys_list[0]][0].join(join_values)
+
         if keys_list and keys_list[0].lower() == 'fn::sub':
             item_to_sub = value[keys_list[0]]
+
             if not isinstance(item_to_sub, list):
                 attr_refs = dict([(r, {'Ref': r}) for r in STATIC_REFS])
                 item_to_sub = [item_to_sub, attr_refs]
             result = item_to_sub[0]
+
             for key, val in item_to_sub[1].items():
                 val = resolve_refs_recursively(stack_name, val, resources)
                 result = result.replace('${%s}' % key, val)
+
             return result
+
+        if keys_list and keys_list[0].lower() == 'fn::findinmap':
+            result = resolve_ref(stack_name, value[keys_list[0]][0], resources, attribute=value[keys_list[0]][1])
+            if not result:
+                raise Exception('Cannot resolve fn::FindInMap: %s %s' % (value[keys_list[0]], list(resources.keys())))
+
+            result = result.get(value[keys_list[0]][2])
+            return result
+
+        if keys_list and keys_list[0].lower() == 'fn::importvalue':
+            exports = cloudformation_backends[aws_stack.get_region()].exports
+            export = exports[value[keys_list[0]]]
+            return export.value
+
         else:
             for key, val in iteritems(value):
                 value[key] = resolve_refs_recursively(stack_name, val, resources)
+
     if isinstance(value, list):
         for i in range(0, len(value)):
             value[i] = resolve_refs_recursively(stack_name, value[i], resources)
+
     return value
 
 
@@ -782,6 +1212,7 @@ def update_resource(resource_id, resources, stack_name):
         return
     LOG.info('Updating resource %s of type %s' % (resource_id, resource_type))
     props = resource['Properties']
+
     if resource_type == 'Lambda::Function':
         client = aws_stack.connect_to_service('lambda')
         keys = ('FunctionName', 'Role', 'Handler', 'Description', 'Timeout', 'MemorySize', 'Environment', 'Runtime')
@@ -789,7 +1220,12 @@ def update_resource(resource_id, resources, stack_name):
         update_props = resolve_refs_recursively(stack_name, update_props, resources)
         if 'Code' in props:
             client.update_function_code(FunctionName=props['FunctionName'], **props['Code'])
+        if 'Environment' in update_props:
+            environment_variables = update_props['Environment'].get('Variables', {})
+            update_props['Environment']['Variables'] = {k: str(v) for k, v in environment_variables.items()}
+
         return client.update_function_configuration(**update_props)
+
     if resource_type == 'ApiGateway::Method':
         client = aws_stack.connect_to_service('apigateway')
         integration = props.get('Integration')
@@ -806,6 +1242,7 @@ def update_resource(resource_id, resources, stack_name):
             kwargs['uri'] = integration.get('Uri')
             return client.put_integration(**kwargs)
         kwargs['authorizationType'] = props.get('AuthorizationType')
+
         return client.put_method(**kwargs)
 
 
@@ -854,6 +1291,9 @@ def remove_none_values(params):
             for k, v in dict(o).items():
                 if v is None:
                     o.pop(k)
+        if isinstance(o, list):
+            common.run_safe(o.remove, None)
+            common.run_safe(o.remove, PLACEHOLDER_AWS_NO_VALUE)
         return o
     result = common.recurse_object(params, remove_nones)
     return result
@@ -864,6 +1304,23 @@ def deploy_resource(resource_id, resources, stack_name):
 
 
 def delete_resource(resource_id, resources, stack_name):
+    res = resources[resource_id]
+    if res['ResourceType'] == 'AWS::S3::Bucket':
+        s3_listener.remove_bucket_notification(res['PhysicalResourceId'])
+
+    if res['ResourceType'] == 'AWS::IAM::Role':
+        role_name = res['PhysicalResourceId']
+
+        iam_client = aws_stack.connect_to_service('iam')
+        rs = iam_client.list_role_policies(
+            RoleName=role_name
+        )
+        for policy in rs['PolicyNames']:
+            iam_client.delete_role_policy(
+                RoleName=role_name,
+                PolicyName=policy
+            )
+
     return execute_resource_action(resource_id, resources, stack_name, ACTION_DELETE)
 
 
@@ -891,6 +1348,21 @@ def execute_resource_action(resource_id, resources, stack_name, action_name):
     return (results or [None])[0]
 
 
+def fix_resource_props_for_sdk_deployment(resource_type, resource_props):
+    if resource_type == 'Lambda::Function':
+        # Properties will be validated by botocore before sending request to AWS
+        # botocore/data/lambda/2015-03-31/service-2.json:1161 (EnvironmentVariableValue)
+        # https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-properties-lambda-function-environment.html
+        if 'Environment' in resource_props:
+            environment_variables = resource_props['Environment'].get('Variables', {})
+            resource_props['Environment']['Variables'] = {k: str(v) for k, v in environment_variables.items()}
+
+    if resource_type == 'SQS::Queue':
+        # https://github.com/localstack/localstack/issues/3004
+        if 'ReceiveMessageWaitTimeSeconds' in resource_props:
+            resource_props['ReceiveMessageWaitTimeSeconds'] = int(resource_props['ReceiveMessageWaitTimeSeconds'])
+
+
 def configure_resource_via_sdk(resource_id, resources, resource_type, func_details, stack_name):
     resource = resources[resource_id]
     client = get_client(resource, func_details)
@@ -900,6 +1372,9 @@ def configure_resource_via_sdk(resource_id, resources, resource_type, func_detai
     if 'Properties' not in resource:
         resource['Properties'] = {}
     resource_props = resource['Properties']
+
+    # Validate props for each resource type
+    fix_resource_props_for_sdk_deployment(resource_type, resource_props)
 
     if callable(params):
         params = params(resource_props, stack_name=stack_name, resources=resources)
@@ -937,6 +1412,10 @@ def configure_resource_via_sdk(resource_id, resources, resource_type, func_detai
     # assign default values if empty
     params = common.merge_recursive(defaults, params)
 
+    # this is an indicator that we should skip this resource deployment, and return
+    if params is None:
+        return
+
     # convert refs and boolean strings
     for param_key, param_value in dict(params).items():
         if param_value is not None:
@@ -964,23 +1443,59 @@ def configure_resource_via_sdk(resource_id, resources, resource_type, func_detai
     # some resources have attached/nested resources which we need to create recursively now
     if resource_type == 'ApiGateway::Method':
         integration = resource_props.get('Integration')
+        apigateway = aws_stack.connect_to_service('apigateway')
         if integration:
             api_id = resolve_refs_recursively(stack_name, resource_props['RestApiId'], resources)
             res_id = resolve_refs_recursively(stack_name, resource_props['ResourceId'], resources)
-            uri = integration.get('Uri')
-            if uri:
-                uri = resolve_refs_recursively(stack_name, uri, resources)
-                aws_stack.connect_to_service('apigateway').put_integration(
-                    restApiId=api_id, resourceId=res_id,
-                    httpMethod=resource_props['HttpMethod'], type=integration['Type'],
-                    integrationHttpMethod=integration['IntegrationHttpMethod'], uri=uri)
+            kwargs = {}
+            if integration.get('Uri'):
+                uri = resolve_refs_recursively(stack_name, integration.get('Uri'), resources)
+
+                # Moto has a validate method on Uri for integration_type "HTTP" | "HTTP_PROXY" that does not accept
+                # Uri value without path, we need to add path ("/") if not exists
+                if integration.get('Type') in ['HTTP', 'HTTP_PROXY']:
+                    rs = urlparse(uri)
+                    if not rs.path:
+                        uri = '{}/'.format(uri)
+
+                kwargs['uri'] = uri
+
+            if integration.get('IntegrationHttpMethod'):
+                kwargs['integrationHttpMethod'] = integration['IntegrationHttpMethod']
+
+            apigateway.put_integration(
+                restApiId=api_id,
+                resourceId=res_id,
+                httpMethod=resource_props['HttpMethod'],
+                type=integration['Type'],
+                **kwargs
+            )
+
+        responses = resource_props.get('MethodResponses') or []
+        for response in responses:
+            api_id = resolve_refs_recursively(stack_name, resource_props['RestApiId'], resources)
+            res_id = resolve_refs_recursively(stack_name, resource_props['ResourceId'], resources)
+            apigateway.put_method_response(restApiId=api_id, resourceId=res_id,
+                httpMethod=resource_props['HttpMethod'], statusCode=str(response['StatusCode']),
+                responseParameters=response.get('ResponseParameters', {}))
+
+    elif resource_type == 'ApiGateway::RestApi':
+        body = resource_props.get('Body')
+        if body:
+            body = json.dumps(body) if isinstance(body, dict) else body
+            client.put_rest_api(restApiId=result['id'], body=common.to_bytes(body))
+
     elif resource_type == 'SNS::Topic':
         subscriptions = resource_props.get('Subscription', [])
         for subscription in subscriptions:
+            if not subscription:
+                continue
+
             endpoint = resolve_refs_recursively(stack_name, subscription['Endpoint'], resources)
             topic_arn = retrieve_topic_arn(params['Name'])
             aws_stack.connect_to_service('sns').subscribe(
-                TopicArn=topic_arn, Protocol=subscription['Protocol'], Endpoint=endpoint)
+                TopicArn=topic_arn, Protocol=subscription['Protocol'], Endpoint=endpoint
+            )
     elif resource_type == 'S3::Bucket':
         tags = resource_props.get('Tags')
         if tags:
@@ -990,42 +1505,12 @@ def configure_resource_via_sdk(resource_id, resources, resource_type, func_detai
     return result
 
 
-# TODO remove?
-def deploy_template(template, stack_name):
-    if isinstance(template, string_types):
-        template = parse_template(template)
-
-    resource_map = template.get('Resources')
-    if not resource_map:
-        LOG.warning('CloudFormation template contains no Resources section')
-        return
-
-    next = resource_map
-
-    iters = 10
-    for i in range(0, iters):
-
-        # get resource details
-        for resource_id, resource in next.items():
-            stack_resource = describe_stack_resource(stack_name, resource_id)
-            resource['__details__'] = stack_resource
-
-        next = resources_to_deploy_next(resource_map, stack_name)
-        if not next:
-            return
-
-        for resource_id, resource in next.items():
-            deploy_resource(resource_id, resource_map, stack_name=stack_name)
-
-    LOG.warning('Unable to resolve all dependencies and deploy all resources ' +
-        'after %s iterations. Remaining (%s): %s' % (iters, len(next), next))
-
-
 def delete_stack(stack_name, stack_resources):
     resources = dict([(r['LogicalResourceId'], common.clone_safe(r)) for r in stack_resources])
     for key, resource in resources.items():
         resources[key]['Properties'] = common.clone_safe(resource)
-    for resource_id, resource in resources.items():
+
+    for resource_id in resources.keys():
         delete_resource(resource_id, resources, stack_name)
 
 
@@ -1041,18 +1526,27 @@ def is_deployable_resource(resource):
     return bool(entry and entry.get(ACTION_CREATE))
 
 
+def get_deployment_state(resource_id, resources, stack_name):
+    res_details = resources[resource_id]
+    resource_status = res_details.get('__details__') or {}
+    details = retrieve_and_update_resource_details(resource_id, resource_status, resources, stack_name)
+    return details
+
+
 def is_deployed(resource_id, resources, stack_name):
-    resource = resources[resource_id]
-    resource_status = resource.get('__details__') or {}
-    details = retrieve_resource_details(resource_id, resource_status, resources, stack_name)
+    details = get_deployment_state(resource_id, resources, stack_name)
     return bool(details)
 
 
-def should_be_deployed(resource_id, resources, stack_name):
+def should_be_deployed(resource_id, resources, stack_name, deploy_state=None):
     """ Return whether the given resource is all of: (1) deployable, (2) not yet deployed,
         and (3) has no unresolved dependencies. """
-    resource = resources[resource_id]
-    if not is_deployable_resource(resource) or is_deployed(resource_id, resources, stack_name):
+    res_details = resources[resource_id]
+    if not is_deployable_resource(res_details):
+        return False
+    if deploy_state is None:
+        deploy_state = is_deployed(resource_id, resources, stack_name)
+    if deploy_state:
         return False
     return all_resource_dependencies_satisfied(resource_id, resources, stack_name)
 
@@ -1067,19 +1561,31 @@ def is_updateable(resource_id, resources, stack_name):
 
 
 def all_resource_dependencies_satisfied(resource_id, resources, stack_name):
+    unsatisfied = get_unsatisfied_dependencies(resource_id, resources, stack_name)
+    return not unsatisfied
+
+
+def get_unsatisfied_dependencies(resource_id, resources, stack_name):
     resource = resources[resource_id]
     res_deps = get_resource_dependencies(resource_id, resource, resources)
-    return all_dependencies_satisfied(res_deps, stack_name, resources, resource_id)
+    return get_unsatisfied_dependencies_for_resources(res_deps, stack_name, resources, resource_id)
 
 
-def all_dependencies_satisfied(resources, stack_name, all_resources, depending_resource=None):
+def get_unsatisfied_dependencies_for_resources(
+        resources, stack_name, all_resources, depending_resource=None, return_first=True):
+    result = {}
     for resource_id, resource in iteritems(resources):
         if is_deployable_resource(resource):
             if not is_deployed(resource_id, all_resources, stack_name):
-                return False
-    return True
+                LOG.debug('Dependency for resource %s not yet deployed: %s %s' %
+                    (depending_resource, resource_id, resource))
+                result[resource_id] = resource
+                if return_first:
+                    break
+    return result
 
 
+# TODO: check if still needed
 def resources_to_deploy_next(resources, stack_name):
     result = {}
     for resource_id, resource in resources.items():
@@ -1102,4 +1608,5 @@ def get_resource_dependencies(resource_id, resource, resources):
                 result[other_id] = other
             if other_id in dependencies:
                 result[other_id] = other
+
     return result

@@ -1,9 +1,13 @@
+import re
 import json
 import random
-from datetime import datetime
+import cbor2
+import base64
 from requests.models import Response
 from localstack import config
-from localstack.utils.common import to_str, json_safe, clone
+from localstack.constants import APPLICATION_JSON, APPLICATION_CBOR
+from localstack.utils.aws import aws_stack
+from localstack.utils.common import to_str, json_safe, clone, epoch_timestamp, now_utc
 from localstack.utils.analytics import event_publisher
 from localstack.services.awslambda import lambda_api
 from localstack.services.generic_proxy import ProxyListener
@@ -16,6 +20,7 @@ ACTION_LIST_STREAMS = '%s.ListStreams' % ACTION_PREFIX
 ACTION_CREATE_STREAM = '%s.CreateStream' % ACTION_PREFIX
 ACTION_DELETE_STREAM = '%s.DeleteStream' % ACTION_PREFIX
 ACTION_UPDATE_SHARD_COUNT = '%s.UpdateShardCount' % ACTION_PREFIX
+ACTION_GET_RECORDS = '%s.GetRecords' % ACTION_PREFIX
 
 # list of stream consumer details
 STREAM_CONSUMERS = []
@@ -25,18 +30,18 @@ class ProxyListenerKinesis(ProxyListener):
 
     def forward_request(self, method, path, data, headers):
         global STREAM_CONSUMERS
-        data = json.loads(to_str(data or '{}'))
-        action = headers.get('X-Amz-Target')
+        data = self.decode_content(data or '{}')
+        action = headers.get('X-Amz-Target', '').split('.')[-1]
 
-        if action == '%s.RegisterStreamConsumer' % ACTION_PREFIX:
+        if action == 'RegisterStreamConsumer':
             consumer = clone(data)
             consumer['ConsumerStatus'] = 'ACTIVE'
             consumer['ConsumerARN'] = '%s/consumer/%s' % (data['StreamARN'], data['ConsumerName'])
-            consumer['ConsumerCreationTimestamp'] = datetime.now()
+            consumer['ConsumerCreationTimestamp'] = float(now_utc())
             consumer = json_safe(consumer)
             STREAM_CONSUMERS.append(consumer)
             return {'Consumer': consumer}
-        elif action == '%s.DeregisterStreamConsumer' % ACTION_PREFIX:
+        elif action == 'DeregisterStreamConsumer':
             def consumer_matches(c):
                 stream_arn = data.get('StreamARN')
                 cons_name = data.get('ConsumerName')
@@ -45,18 +50,19 @@ class ProxyListenerKinesis(ProxyListener):
                     (c.get('StreamARN') == stream_arn and c.get('ConsumerName') == cons_name))
             STREAM_CONSUMERS = [c for c in STREAM_CONSUMERS if not consumer_matches(c)]
             return {}
-        elif action == '%s.ListStreamConsumers' % ACTION_PREFIX:
+        elif action == 'ListStreamConsumers':
             result = {
                 'Consumers': [c for c in STREAM_CONSUMERS if c.get('StreamARN') == data.get('StreamARN')]
             }
             return result
-        elif action == '%s.DescribeStreamConsumer' % ACTION_PREFIX:
+        elif action == 'DescribeStreamConsumer':
             consumer_arn = data.get('ConsumerARN') or data['ConsumerName']
             consumer_name = data.get('ConsumerName') or data['ConsumerARN']
+            creation_timestamp = data.get('ConsumerCreationTimestamp')
             result = {
                 'ConsumerDescription': {
                     'ConsumerARN': consumer_arn,
-                    # 'ConsumerCreationTimestamp': number,
+                    'ConsumerCreationTimestamp': creation_timestamp,
                     'ConsumerName': consumer_name,
                     'ConsumerStatus': 'ACTIVE',
                     'StreamARN': data.get('StreamARN')
@@ -72,7 +78,8 @@ class ProxyListenerKinesis(ProxyListener):
 
     def return_response(self, method, path, data, headers, response):
         action = headers.get('X-Amz-Target')
-        data = json.loads(to_str(data or '{}'))
+        data = self.decode_content(data or '{}')
+        response._content = self.replace_in_encoded(response.content or '')
 
         records = []
         if action in (ACTION_CREATE_STREAM, ACTION_DELETE_STREAM):
@@ -83,9 +90,11 @@ class ProxyListenerKinesis(ProxyListener):
                 payload['s'] = data.get('ShardCount')
             event_publisher.fire_event(event_type, payload=payload)
         elif action == ACTION_PUT_RECORD:
-            response_body = json.loads(to_str(response.content))
+            response_body = self.decode_content(response.content)
             event_record = {
+                'approximateArrivalTimestamp': epoch_timestamp(),
                 'data': data['Data'],
+                'encryptionType': 'NONE',
                 'partitionKey': data['PartitionKey'],
                 'sequenceNumber': response_body.get('SequenceNumber')
             }
@@ -94,14 +103,16 @@ class ProxyListenerKinesis(ProxyListener):
             lambda_api.process_kinesis_records(event_records, stream_name)
         elif action == ACTION_PUT_RECORDS:
             event_records = []
-            response_body = json.loads(to_str(response.content))
+            response_body = self.decode_content(response.content)
             if 'Records' in response_body:
                 response_records = response_body['Records']
                 records = data['Records']
                 for index in range(0, len(records)):
                     record = records[index]
                     event_record = {
+                        'approximateArrivalTimestamp': epoch_timestamp(),
                         'data': record['Data'],
+                        'encryptionType': 'NONE',
                         'partitionKey': record['PartitionKey'],
                         'sequenceNumber': response_records[index].get('SequenceNumber')
                     }
@@ -129,6 +140,56 @@ class ProxyListenerKinesis(ProxyListener):
             response.encoding = 'UTF-8'
             response._content = json.dumps(content)
             return response
+        elif action == ACTION_GET_RECORDS:
+            sdk_v2 = self.sdk_is_v2(headers.get('User-Agent', '').split(' ')[0])
+            results, encoding_type = self.decode_content(response.content, True)
+
+            for record in results['Records']:
+                if sdk_v2:
+                    record['ApproximateArrivalTimestamp'] = int(record['ApproximateArrivalTimestamp'] * 1000)
+                if not isinstance(record['Data'], str):
+                    record['Data'] = base64.encodebytes(bytearray(record['Data']['data']))
+
+            if encoding_type == APPLICATION_CBOR:
+                response._content = cbor2.dumps(results)
+            else:
+                response._content = json.dumps(results)
+
+            return response
+
+    def sdk_is_v2(self, user_agent):
+        if re.search(r'\/2.\d+.\d+', user_agent):
+            return True
+        return False
+
+    def replace_in_encoded(self, data):
+        if not data:
+            return ''
+
+        decoded, type_encoding = self.decode_content(data, True)
+
+        if type_encoding == APPLICATION_JSON:
+            return re.sub(r'arn:aws:kinesis:[^:]+:', 'arn:aws:kinesis:%s:' % aws_stack.get_region(),
+            to_str(data))
+
+        if type_encoding == APPLICATION_CBOR:
+            replaced = re.sub(r'arn:aws:kinesis:[^:]+:', 'arn:aws:kinesis:%s:' % aws_stack.get_region(),
+            json.dumps(decoded))
+            return cbor2.dumps(json.loads(replaced))
+
+    def decode_content(self, data, describe=False):
+        content_type = ''
+        try:
+            decoded = json.loads(to_str(data))
+            content_type = APPLICATION_JSON
+        except UnicodeDecodeError:
+            decoded = cbor2.loads(data)
+            content_type = APPLICATION_CBOR
+
+        if describe:
+            return decoded, content_type
+
+        return decoded
 
 
 # instantiate listener
